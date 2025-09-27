@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	promregistry "github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -374,6 +375,12 @@ backends:
 		}
 	}()
 
+	// UNIX doesn't like the long socket paths, so create a temp directory for the socket instead of t.TempDir.
+	socketTempDir := "/tmp/" + uuid.NewString()
+	t.Cleanup(func() { _ = os.RemoveAll(socketTempDir) })
+	require.NoError(t, os.MkdirAll(socketTempDir, 0o700))
+	socketPath := filepath.Join(socketTempDir, "mcp.sock")
+
 	// Run ExtProc in a goroutine on ephemeral ports.
 	errCh := make(chan error, 1)
 	go func() {
@@ -382,6 +389,7 @@ backends:
 			"-extProcAddr", ":0",
 			"-metricsPort", "0",
 			"-healthPort", "0",
+			"-mcpAddr", "unix://" + socketPath,
 		}
 		errCh <- Main(ctx, args, stderrW)
 	}()

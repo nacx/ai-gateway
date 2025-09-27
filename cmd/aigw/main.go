@@ -36,8 +36,9 @@ type (
 	}
 	// cmdRun corresponds to `aigw run` command.
 	cmdRun struct {
-		Debug bool   `help:"Enable debug logging emitted to stderr."`
-		Path  string `arg:"" name:"path" optional:"" help:"Path to the AI Gateway configuration yaml file. Optional when at least OPENAI_API_KEY is set." type:"path"`
+		Debug     bool   `help:"Enable debug logging emitted to stderr."`
+		Path      string `arg:"" name:"path" optional:"" help:"Path to the AI Gateway configuration yaml file. Optional when at least OPENAI_API_KEY is set." type:"path"`
+		McpConfig string `name:"mcp-config" help:"(Optional) Path to the file containing the list of MCP servers. When this is given, any other given config file is ignored." type:"path"`
 	}
 )
 

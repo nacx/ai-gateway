@@ -28,13 +28,14 @@ import (
 
 // TestEnvironment holds all the services needed for tests.
 type TestEnvironment struct {
-	upstreamPortDefault, upstreamPort                  int
-	extprocBin, extprocConfig                          string
-	extprocEnv                                         []string
-	extProcPort, extProcMetricsPort, extProcHealthPort int
-	envoyConfig                                        string
-	envoyListenerPort, envoyAdminPort                  int
-	upstreamOut, extprocOut, envoyStdout, envoyStderr  *syncBuffer
+	miscPortDefaults, miscPorts                                        map[string]int
+	extprocBin, extprocConfig                                          string
+	extprocEnv                                                         []string
+	extProcPort, extProcMetricsPort, extProcHealthPort, extProcMCPPort int
+	mcpWriteTimeout                                                    time.Duration
+	envoyConfig                                                        string
+	envoyListenerPort, envoyAdminPort                                  int
+	upstreamOut, extprocOut, envoyStdout, envoyStderr                  *syncBuffer
 }
 
 func (e *TestEnvironment) LogOutput(t TestingT) {
@@ -70,6 +71,7 @@ type TestingT interface {
 	TempDir() string
 	Context() context.Context
 	Cleanup(func())
+	Setenv(key, value string)
 	Failed() bool
 }
 
@@ -79,37 +81,54 @@ type TestingT interface {
 // mainlib.Main instead of the built binary. This allows the benchmark test suite to directly do the profiling
 // without the extroc.
 func StartTestEnvironment(t TestingT,
-	requireNewUpstream func(t TestingT, out io.Writer, port int), upstreamPortDefault int,
+	requireNewUpstream func(t TestingT, out io.Writer, miscPorts map[string]int), miscPortDefauls map[string]int,
 	extprocBin, extprocConfig string, extprocEnv []string, envoyConfig string, okToDumpLogOnFailure, extProcInProcess bool,
+	mcpWriteTimeout time.Duration,
 ) *TestEnvironment {
 	// Get random ports for all services.
-	ports := requireRandomPorts(t, 6)
-
-	env := &TestEnvironment{
-		upstreamPortDefault: upstreamPortDefault,
-		upstreamPort:        ports[0],
-		extprocBin:          extprocBin,
-		extprocConfig:       extprocConfig,
-		extprocEnv:          extprocEnv,
-		extProcPort:         ports[1],
-		extProcMetricsPort:  ports[2],
-		extProcHealthPort:   ports[3],
-		envoyConfig:         envoyConfig,
-		envoyListenerPort:   ports[4],
-		envoyAdminPort:      ports[5],
-		upstreamOut:         newSyncBuffer(),
-		extprocOut:          newSyncBuffer(),
-		envoyStdout:         newSyncBuffer(),
-		envoyStderr:         newSyncBuffer(),
+	ports := requireRandomPorts(t, 6+len(miscPortDefauls))
+	miscPorts := make(map[string]int)
+	index := 0
+	for key := range miscPortDefauls {
+		miscPorts[key] = ports[6+index]
+		index++
 	}
 
-	t.Logf("Starting test environment with ports: upstream=%d, extproc=%d, envoyListener=%d, envoyAdmin=%d",
-		env.upstreamPort, env.extProcPort, env.envoyListenerPort, env.envoyAdminPort)
+	env := &TestEnvironment{
+		extprocBin:         extprocBin,
+		extprocConfig:      extprocConfig,
+		extprocEnv:         extprocEnv,
+		extProcPort:        ports[0],
+		extProcMetricsPort: ports[1],
+		extProcHealthPort:  ports[2],
+		envoyConfig:        envoyConfig,
+		envoyListenerPort:  ports[3],
+		envoyAdminPort:     ports[4],
+		extProcMCPPort:     ports[5],
+		miscPorts:          miscPorts,
+		miscPortDefaults:   miscPortDefauls,
+		upstreamOut:        newSyncBuffer(),
+		extprocOut:         newSyncBuffer(),
+		envoyStdout:        newSyncBuffer(),
+		envoyStderr:        newSyncBuffer(),
+		mcpWriteTimeout:    mcpWriteTimeout,
+	}
+
+	t.Logf("Starting test environment with ports: extproc=%d, envoyListener=%d, envoyAdmin=%d misc=%v",
+		env.extProcPort, env.envoyListenerPort, env.envoyAdminPort, env.miscPorts)
 
 	// The startup order is required: upstream, extProc, then envoy.
+	requireNewUpstream(t, env.upstreamOut, env.miscPorts)
 
-	// Start the upstream.
-	requireNewUpstream(t, env.upstreamOut, env.upstreamPort)
+	// Replaces ports in extProcConfig.
+	replacements := map[string]string{}
+	for name, port := range env.miscPorts {
+		defaultPort, ok := env.miscPortDefaults[name]
+		require.True(t, ok)
+		replacements[strconv.Itoa(defaultPort)] = strconv.Itoa(port)
+	}
+	processedExtProcConfig := replaceTokens(env.extprocConfig, replacements)
+	env.extprocConfig = processedExtProcConfig
 
 	// Start ExtProc.
 	requireExtProc(t,
@@ -120,6 +139,8 @@ func StartTestEnvironment(t TestingT,
 		env.extProcPort,
 		env.extProcMetricsPort,
 		env.extProcHealthPort,
+		env.extProcMCPPort,
+		env.mcpWriteTimeout,
 		extProcInProcess,
 	)
 
@@ -131,8 +152,9 @@ func StartTestEnvironment(t TestingT,
 		env.envoyListenerPort,
 		env.envoyAdminPort,
 		env.extProcPort,
-		env.upstreamPortDefault,
-		env.upstreamPort,
+		env.extProcMCPPort,
+		env.miscPorts,
+		env.miscPortDefaults,
 	)
 
 	// Log outputs on test failure.
@@ -170,9 +192,11 @@ func (e *TestEnvironment) checkAllConnections(t TestingT) error {
 	errGroup.Go(func() error {
 		return e.checkConnection(t, e.envoyAdminPort, "envoyAdmin")
 	})
-	errGroup.Go(func() error {
-		return e.checkConnection(t, e.upstreamPort, "upstream")
-	})
+	for name, port := range e.miscPorts {
+		errGroup.Go(func() error {
+			return e.checkConnection(t, port, fmt.Sprintf("misc-%s", name))
+		})
+	}
 	return errGroup.Wait()
 }
 
@@ -239,17 +263,23 @@ func waitForReadyMessage(ctx context.Context, outReader io.Reader, readyMessage 
 func requireEnvoy(t TestingT,
 	stdout, stderr io.Writer,
 	config string,
-	listenerPort, adminPort, extProcPort, upstreamPortDefault, upstreamPort int,
+	listenerPort, adminPort, extProcPort, extProcMCPPort int,
+	miscPorts, miscPortDefaults map[string]int,
 ) {
 	// Use specific patterns to avoid breaking cluster names.
 	replacements := map[string]string{
 		"port_value: 1062": "port_value: " + strconv.Itoa(listenerPort),
 		"port_value: 9901": "port_value: " + strconv.Itoa(adminPort),
 		"port_value: 1063": "port_value: " + strconv.Itoa(extProcPort),
-		"port_value: " + strconv.Itoa(upstreamPortDefault): "port_value: " + strconv.Itoa(upstreamPort),
+		"port_value: 9856": "port_value: " + strconv.Itoa(extProcMCPPort),
 		// Handle any docker substitutions. These are ignored otherwise.
 		"address: extproc":              "address: 127.0.0.1",
 		"address: host.docker.internal": "address: 127.0.0.1",
+	}
+	for name, port := range miscPorts {
+		defaultPort, ok := miscPortDefaults[name]
+		require.True(t, ok, "missing default port for misc port %q", name)
+		replacements["port_value: "+strconv.Itoa(defaultPort)] = "port_value: " + strconv.Itoa(port)
 	}
 
 	processedConfig := replaceTokens(config, replacements)
@@ -271,7 +301,10 @@ func requireEnvoy(t TestingT,
 }
 
 // requireExtProc starts the external processor with the given configuration.
-func requireExtProc(t TestingT, out io.Writer, bin, config string, env []string, port, metricsPort, healthPort int, inProcess bool) {
+func requireExtProc(t TestingT, out io.Writer, bin, config string,
+	env []string, port, metricsPort, healthPort, mcpPort int,
+	mcpWriteTimeout time.Duration, inProcess bool,
+) {
 	configPath := t.TempDir() + "/extproc-config.yaml"
 	require.NoError(t, os.WriteFile(configPath, []byte(config), 0o600))
 
@@ -280,10 +313,21 @@ func requireExtProc(t TestingT, out io.Writer, bin, config string, env []string,
 		"-extProcAddr", fmt.Sprintf(":%d", port),
 		"-metricsPort", strconv.Itoa(metricsPort),
 		"-healthPort", strconv.Itoa(healthPort),
+		"-mcpAddr", ":" + strconv.Itoa(mcpPort),
+		"-mcpWriteTimeout", mcpWriteTimeout.String(),
 		"-logLevel", "info",
 	}
+	t.Logf("Starting ExtProc with args: %v", args)
 	if inProcess {
 		go func() {
+			for _, e := range env {
+				parts := strings.Split(e, "=")
+				if len(parts) != 2 {
+					t.Logf("Skippint invalid environ: %s", e)
+					continue
+				}
+				t.Setenv(parts[0], parts[1])
+			}
 			err := mainlib.Main(t.Context(), args, os.Stdout)
 			if err != nil {
 				panic(err)

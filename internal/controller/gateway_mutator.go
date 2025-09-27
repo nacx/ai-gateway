@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -23,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	aigv1a1 "github.com/envoyproxy/ai-gateway/api/v1alpha1"
+	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 )
 
 // gatewayMutator implements [admission.CustomDefaulter].
@@ -90,7 +92,7 @@ func (g *gatewayMutator) Default(ctx context.Context, obj runtime.Object) error 
 }
 
 // buildExtProcArgs builds all command line arguments for the extproc container.
-func (g *gatewayMutator) buildExtProcArgs(filterConfigFullPath string, extProcMetricsPort, extProcHealthPort int) []string {
+func (g *gatewayMutator) buildExtProcArgs(filterConfigFullPath string, extProcMetricsPort, extProcHealthPort int, needMCP bool) []string {
 	args := []string{
 		"-configPath", filterConfigFullPath,
 		"-logLevel", g.extProcLogLevel,
@@ -99,6 +101,9 @@ func (g *gatewayMutator) buildExtProcArgs(filterConfigFullPath string, extProcMe
 		"-healthPort", fmt.Sprintf("%d", extProcHealthPort),
 		"-rootPrefix", g.rootPrefix,
 		"-maxRecvMsgSize", fmt.Sprintf("%d", g.extProcMaxRecvMsgSize),
+	}
+	if needMCP {
+		args = append(args, "-mcpAddr", ":"+strconv.Itoa(internalapi.MCPProxyPort))
 	}
 
 	// Add metrics header label mapping if configured.
@@ -158,10 +163,19 @@ func (g *gatewayMutator) mutatePod(ctx context.Context, pod *corev1.Pod, gateway
 	if err != nil {
 		return fmt.Errorf("failed to list routes: %w", err)
 	}
-	if len(routes.Items) == 0 {
-		g.logger.Info("no AIGatewayRoutes found for gateway", "name", gatewayName, "namespace", gatewayNamespace)
+
+	var mcpRoutes aigv1a1.MCPRouteList
+	err = g.c.List(ctx, &mcpRoutes, client.MatchingFields{
+		k8sClientIndexMCPRouteToAttachedGateway: fmt.Sprintf("%s.%s", gatewayName, gatewayNamespace),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list routes: %w", err)
+	}
+	if len(routes.Items) == 0 && len(mcpRoutes.Items) == 0 {
+		g.logger.Info("no AIGatewayRoutes or MCPRoutes found for gateway", "name", gatewayName, "namespace", gatewayNamespace)
 		return nil
 	}
+	g.logger.Info("found routes for gateway", "aigatewayroute_count", len(routes.Items), "mcpgatewayroute_count", len(mcpRoutes.Items))
 
 	podspec := &pod.Spec
 
@@ -221,7 +235,7 @@ func (g *gatewayMutator) mutatePod(ctx context.Context, pod *corev1.Pod, gateway
 		Ports: []corev1.ContainerPort{
 			{Name: "aigw-metrics", ContainerPort: extProcMetricsPort},
 		},
-		Args: g.buildExtProcArgs(filterConfigFullPath, extProcMetricsPort, extProcHealthPort),
+		Args: g.buildExtProcArgs(filterConfigFullPath, extProcMetricsPort, extProcHealthPort, len(mcpRoutes.Items) > 0),
 		Env:  envVars,
 		VolumeMounts: []corev1.VolumeMount{
 			{

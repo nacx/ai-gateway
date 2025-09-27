@@ -130,9 +130,12 @@ Arguments:
               least OPENAI_API_KEY is set.
 
 Flags:
-  -h, --help     Show context-sensitive help.
+  -h, --help                 Show context-sensitive help.
 
-      --debug    Enable debug logging emitted to stderr.
+      --debug                Enable debug logging emitted to stderr.
+      --mcp-config=STRING    (Optional) Path to the file containing the list of
+                             MCP servers. When this is given, any other given
+                             config file is ignored.
 `,
 			expPanicCode: ptr.To(0),
 		},
